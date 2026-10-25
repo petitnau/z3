@@ -205,6 +205,89 @@ static void check_array_domain(char const* input, lbool expected) {
     VERIFY(expected == slv->check_sat(0, nullptr));
 }
 
+static void check_array_map_equalities() {
+    struct {
+        char const* input;
+        lbool expected;
+    } cases[] = {
+        {"(assert (= ((_ map or)"
+         " (store ((as const (Array Bool Bool Bool)) false) true true true)"
+         " (store ((as const (Array Bool Bool Bool)) false) false false true))"
+         " ((as const (Array Bool Bool Bool)) true)))", l_false},
+        {"(declare-datatypes () ((D a b c)))"
+         "(assert (= ((_ map or)"
+         " (store ((as const (Array D Bool)) false) a true)"
+         " (store ((as const (Array D Bool)) false) b true))"
+         " ((as const (Array D Bool)) true)))", l_false},
+        {"(assert (= ((_ map or)"
+         " (store ((as const (Array (_ BitVec 2) Bool)) false) #b00 true)"
+         " (store ((as const (Array (_ BitVec 2) Bool)) false) #b11 true))"
+         " ((as const (Array (_ BitVec 2) Bool)) true)))", l_false},
+        {"(declare-datatypes () ((D a b c)))"
+         "(assert (= ((_ map or)"
+         " (store ((as const (Array D Bool Bool)) false) a false true)"
+         " (store ((as const (Array D Bool Bool)) false) b true true))"
+         " ((as const (Array D Bool Bool)) true)))", l_false},
+        {"(declare-datatypes () ((D a b)))"
+         "(assert (= ((_ map or)"
+         " (store ((as const (Array D Bool)) false) a true)"
+         " (store ((as const (Array D Bool)) false) b true))"
+         " ((as const (Array D Bool)) true)))", l_true},
+        {"(declare-const A (Array Bool Bool Bool))"
+         "(declare-const B (Array Bool Bool Bool))"
+         "(assert (= B ((_ map =>) ((as const (Array Bool Bool Bool)) false) A)))"
+         "(assert (= B (store (store ((as const (Array Bool Bool Bool)) false)"
+         " false false true) true true true)))", l_false},
+        {"(declare-const A (Array Bool Bool Bool))"
+         "(assert (= (store (store ((_ map =>) ((as const (Array Bool Bool Bool)) false) A)"
+         " false false false) true true false) ((as const (Array Bool Bool Bool)) false)))", l_false},
+        {"(declare-const A (Array Bool Bool Bool))"
+         "(declare-fun f (Bool Bool) Int)"
+         "(assert (= (f false false) 1)) (assert (= (f false true) 1))"
+         "(assert (= ((_ map f) ((as const (Array Bool Bool Bool)) false) A)"
+         " (store (store ((as const (Array Bool Bool Int)) 0)"
+         " false false 1) true true 1)))", l_false},
+        {"(assert (= ((_ map or)"
+         " (store ((as const (Array Bool Bool Bool)) false) true true true)"
+         " (store ((as const (Array Bool Bool Bool)) false) false false true))"
+         " (store (store ((as const (Array Bool Bool Bool)) false)"
+         " false false true) true true true)))", l_true}
+    };
+    for (unsigned backend = 0; backend < 3; ++backend) {
+        for (auto const& test : cases) {
+            ast_manager m(backend == 1 ? PGM_ENABLED : PGM_DISABLED);
+            reg_decl_plugins(m);
+            cmd_context cmd(false, &m);
+            std::istringstream input(test.input);
+            VERIFY(parse_smt2_commands(cmd, input));
+            if (backend == 2) {
+                params_ref p;
+                p.set_bool("smt", true);
+                ref<solver> slv = mk_smt2_solver(m, p, symbol::null);
+                slv->push();
+                for (expr* assertion : cmd.assertions())
+                    slv->assert_expr(assertion);
+                VERIFY(test.expected == slv->check_sat(0, nullptr));
+                slv->pop(1);
+                VERIFY(l_true == slv->check_sat(0, nullptr));
+            }
+            else {
+                smt_params p;
+                p.m_preprocess = false;
+                smt::context ctx(m, p);
+                ctx.push();
+                for (expr* assertion : cmd.assertions())
+                    ctx.assert_expr(assertion);
+                VERIFY(test.expected == ctx.check());
+                if (backend == 1 && test.expected == l_false)
+                    VERIFY(ctx.get_proof());
+                ctx.pop(1);
+                VERIFY(l_true == ctx.check());
+            }
+        }
+    }
+}
+
 static void check_stored_lambdas() {
     auto check = [](char const* input, lbool expected) {
         ast_manager m;
@@ -651,6 +734,7 @@ void tst_smt_context()
     check_symbolic_regex_substring();
     check_sequence_last_index();
     check_array_index_dependencies();
+    check_array_map_equalities();
     check_stored_lambdas();
     check_sat_array_lambdas();
     check_singleton_array_defaults();

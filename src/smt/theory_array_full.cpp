@@ -22,6 +22,8 @@ Revision History:
 #include "ast/ast_pp.h"
 #include "ast/ast_util.h"
 #include "ast/ast_smt2_pp.h"
+#include "ast/bv_decl_plugin.h"
+#include "ast/datatype_decl_plugin.h"
 #include "smt/smt_context.h"
 #include "smt/theory_array_full.h"
 #include "util/scoped_ptr_vector.h"
@@ -1026,10 +1028,88 @@ namespace smt {
         }
         if (r == FC_DONE && assert_lambda_congruence())
             r = FC_CONTINUE;
+        if (r == FC_DONE && assert_map_congruence())
+            r = FC_CONTINUE;
         bool should_giveup = m_found_unsupported_op || has_propagate_up_trail() || has_non_beta_as_array();
         if (r == FC_DONE && should_giveup)
             r = FC_GIVEUP;
         return r;
+    }
+
+    bool theory_array_full::assert_map_congruence() {
+        bv_util bv(m);
+        datatype_util dt(m);
+        ptr_vector<enode> todo;
+        obj_hashtable<enode> visited;
+        for (unsigned v = 0; v < get_num_vars(); ++v) {
+            enode* n = get_enode(v);
+            if (is_map(n) && ctx.is_relevant(n))
+                todo.push_back(n);
+        }
+        bool added_reads = false;
+        for (unsigned i = 0; i < todo.size(); ++i) {
+            enode* root = todo[i]->get_root();
+            if (visited.contains(root))
+                continue;
+            visited.insert(root);
+            for (enode* p : root->get_parents()) {
+                if (!ctx.is_relevant(p))
+                    continue;
+                if ((is_store(p) && p->get_arg(0)->get_root() == root) || is_map(p))
+                    todo.push_back(p);
+            }
+            if (root->get_next() == root)
+                continue;
+            sort* s = root->get_sort();
+            unsigned arity = get_array_arity(s);
+            unsigned num_values = 1;
+            unsigned_vector sizes;
+            bool enumerate = true;
+            for (unsigned k = 0; k < arity; ++k) {
+                sort* domain = get_array_domain(s, k);
+                sort_size const& size = domain->get_num_elements();
+                if ((!m.is_bool(domain) && !bv.is_bv_sort(domain) && !dt.is_enum_sort(domain)) ||
+                    !size.is_finite() || size.size() > 256 / num_values) {
+                    enumerate = false;
+                    break;
+                }
+                sizes.push_back(static_cast<unsigned>(size.size()));
+                num_values *= sizes.back();
+            }
+            if (enumerate) {
+                expr_ref_vector args(m);
+                args.push_back(root->get_expr());
+                for (unsigned index = 0; index < num_values; ++index) {
+                    args.shrink(1);
+                    unsigned remaining = index;
+                    for (unsigned k = 0; k < arity; ++k) {
+                        sort* domain = get_array_domain(s, k);
+                        unsigned value = remaining % sizes[k];
+                        remaining /= sizes[k];
+                        if (m.is_bool(domain))
+                            args.push_back(value ? m.mk_true() : m.mk_false());
+                        else if (bv.is_bv_sort(domain))
+                            args.push_back(bv.mk_numeral(rational(value), domain));
+                        else
+                            args.push_back(m.mk_const(dt.get_datatype_constructors(domain)->get(value)));
+                    }
+                    expr_ref select(mk_select(args.size(), args.data()), m);
+                    bool fresh = !ctx.e_internalized(select);
+                    ctx.internalize(select, false);
+                    enode* n = ctx.get_enode(select);
+                    if (!ctx.is_relevant(n)) {
+                        ctx.mark_as_relevant(n);
+                        fresh = true;
+                    }
+                    added_reads |= fresh;
+                }
+            }
+            else {
+                for (enode* other = root->get_next(); other != root; other = other->get_next())
+                    assert_congruent(root, other);
+            }
+        }
+        return added_reads || can_propagate();
     }
 
     bool theory_array_full::assert_lambda_congruence() {

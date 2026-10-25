@@ -69,6 +69,8 @@ For example
 --*/
 
 #include "ast/ast_ll_pp.h"
+#include "ast/bv_decl_plugin.h"
+#include "ast/datatype_decl_plugin.h"
 #include "sat/smt/array_solver.h"
 #include "sat/smt/euf_solver.h"
 
@@ -87,6 +89,82 @@ namespace array {
         m_array_hint = symbol("array");
     }
 
+    bool solver::assert_map_congruence() {
+        bv_util bv(m);
+        datatype_util dt(m);
+        euf::enode_vector todo;
+        obj_hashtable<euf::enode> visited;
+        for (unsigned v = 0; v < get_num_vars(); ++v) {
+            euf::enode* n = var2enode(v);
+            if (a.is_map(n->get_expr()) && ctx.is_relevant(n))
+                todo.push_back(n);
+        }
+        unsigned num_axioms = m_axiom_trail.size();
+        bool added_reads = false;
+        for (unsigned i = 0; i < todo.size(); ++i) {
+            euf::enode* root = todo[i]->get_root();
+            if (visited.contains(root))
+                continue;
+            visited.insert(root);
+            for (euf::enode* p : euf::enode_parents(root)) {
+                if (!ctx.is_relevant(p))
+                    continue;
+                if ((a.is_store(p->get_expr()) && p->get_arg(0)->get_root() == root) || a.is_map(p->get_expr()))
+                    todo.push_back(p);
+            }
+            if (root->get_next() == root)
+                continue;
+            sort* s = root->get_sort();
+            unsigned arity = get_array_arity(s);
+            unsigned num_values = 1;
+            unsigned_vector sizes;
+            bool enumerate = true;
+            for (unsigned k = 0; k < arity; ++k) {
+                sort* domain = get_array_domain(s, k);
+                sort_size const& size = domain->get_num_elements();
+                if ((!m.is_bool(domain) && !bv.is_bv_sort(domain) && !dt.is_enum_sort(domain)) ||
+                    !size.is_finite() || size.size() > 256 / num_values) {
+                    enumerate = false;
+                    break;
+                }
+                sizes.push_back(static_cast<unsigned>(size.size()));
+                num_values *= sizes.back();
+            }
+            if (enumerate) {
+                expr_ref_vector args(m);
+                args.push_back(root->get_expr());
+                for (unsigned index = 0; index < num_values; ++index) {
+                    args.shrink(1);
+                    unsigned remaining = index;
+                    for (unsigned k = 0; k < arity; ++k) {
+                        sort* domain = get_array_domain(s, k);
+                        unsigned value = remaining % sizes[k];
+                        remaining /= sizes[k];
+                        if (m.is_bool(domain))
+                            args.push_back(value ? m.mk_true() : m.mk_false());
+                        else if (bv.is_bv_sort(domain))
+                            args.push_back(bv.mk_numeral(rational(value), domain));
+                        else
+                            args.push_back(m.mk_const(dt.get_datatype_constructors(domain)->get(value)));
+                    }
+                    expr_ref select(a.mk_select(args), m);
+                    bool fresh = !ctx.get_egraph().find(select);
+                    euf::enode* n = e_internalize(select);
+                    if (!ctx.is_relevant(n)) {
+                        ctx.get_relevancy().mark_relevant(n);
+                        fresh = true;
+                    }
+                    added_reads |= fresh;
+                }
+            }
+            else {
+                for (euf::enode* other = root->get_next(); other != root; other = other->get_next())
+                    push_axiom(congruence_axiom(root, other));
+            }
+        }
+        return added_reads || m_axiom_trail.size() > num_axioms;
+    }
+
     sat::check_result solver::check() {
         force_push();
         // flet<bool> _is_redundant(m_is_redundant, true);
@@ -100,6 +178,9 @@ namespace array {
         }
             
         if (m_delay_qhead < m_axiom_trail.size()) 
+            return sat::check_result::CR_CONTINUE;
+
+        if (assert_map_congruence())
             return sat::check_result::CR_CONTINUE;
 
         if (!check_lambdas())

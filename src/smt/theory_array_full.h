@@ -92,6 +92,7 @@ namespace smt {
         enode_vector m_as_array;
         enode_vector m_lambdas;
         bool assert_lambda_congruence();
+        bool assert_map_congruence();
         bool has_non_beta_as_array();
         bool is_supported_array_eq(enode* p);
 
